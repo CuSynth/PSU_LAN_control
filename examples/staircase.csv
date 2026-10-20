@@ -1,0 +1,6 @@
+# duration, voltage, current      ('-' keeps the previous value)
+2 s,   1.0, 0.5
+2 s,   2.0, -
+2 s,   3.0, -
+2 s,   4.0, -
+2 s,   5.0, -
