@@ -13,7 +13,7 @@ from PySide6.QtWidgets import (QDoubleSpinBox, QFrame, QGridLayout, QHBoxLayout,
 from dp832_worker import ChannelState
 from .config import N_PRESETS
 
-CH_COLORS = {1: "#f5d742", 2: "#4fd1f5", 3: "#e879f9"}
+CH_COLORS = {1: "#f5d742", 2: "#4fd1f5", 3: "#e879f9", 4: "#7bd88f"}
 MONO = "DejaVu Sans Mono, Consolas, Menlo, monospace"
 
 
@@ -91,8 +91,10 @@ class ChannelPanel(QFrame):
     limits_requested = Signal(int)
     preset_action = Signal(int, str, int)        # channel, load|save|rename|clear, slot
 
-    def __init__(self, ch: int, vmax: float, imax: float):
+    def __init__(self, ch: int, vmax: float, imax: float, profile=None):
         super().__init__()
+        from dp832_worker import profile_for
+        self.profile = profile or profile_for("DP832")
         self.ch, self.color = ch, CH_COLORS.get(ch, "#ffffff")
         self.vmax, self.imax = vmax, imax
         self.state: ChannelState | None = None
@@ -256,8 +258,7 @@ class ChannelPanel(QFrame):
     def set_limits_text(self, vmax, imax, s: ChannelState | None) -> None:
         txt = f"Software limit {vmax:g} V / {imax:g} A"
         if s and s.ovp_level is not None:
-            txt += f"  ·  OVP {s.ovp_level:g} V {'ON' if s.ovp_on else 'off'}"
-            txt += f"  ·  OCP {s.ocp_level:g} A {'ON' if s.ocp_on else 'off'}"
+            txt += "  ·  " + self.protection_text(s.ovp_level, s.ovp_on, s.ocp_level, s.ocp_on)
         self.lim_lbl.setText(txt)
         self.v_spin.setMaximum(min(self.vmax, vmax))
         self.i_spin.setMaximum(min(self.imax, imax))
@@ -279,13 +280,21 @@ class ChannelPanel(QFrame):
                 b.setToolTip("Empty slot - use Save to store the current setup")
                 b.setEnabled(False)
 
-    @staticmethod
-    def preset_tooltip(p: dict) -> str:
+    def protection_text(self, ovp, ovp_on, ocp, ocp_on) -> str:
+        pr = self.profile
+        o = f"OVP {ovp:g} V" + (f" {'ON' if ovp_on else 'off'}" if pr.ovp_enable else "")
+        if pr.ocp_kind == "fuse":
+            c = f"Fuse {'ON' if ocp_on else 'off'} ({ocp:g} ms)"
+        else:
+            c = f"OCP {ocp:g} A {'ON' if ocp_on else 'off'}"
+        return f"{o}  ·  {c}"
+
+    def preset_tooltip(self, p: dict) -> str:
         t = f"{p['v']:g} V / {p['i']:g} A"
         if p.get("vmax") is not None:
             t += f"\nSoftware limit {p['vmax']:g} V / {p['imax']:g} A"
         if p.get("ovp") is not None:
-            t += f"\nOVP {p['ovp']:g} V {'ON' if p.get('ovp_on') else 'off'}, OCP {p['ocp']:g} A {'ON' if p.get('ocp_on') else 'off'}"
+            t += "\n" + self.protection_text(p["ovp"], p.get("ovp_on"), p["ocp"], p.get("ocp_on"))
         return t + "\nLoading turns the channel OFF first."
 
     def set_sequence(self, text: str | None) -> None:
@@ -315,7 +324,8 @@ class ChannelPanel(QFrame):
             txt, col = "—", "#6b7079"
         self.mode_lbl.setText(txt)
         self.mode_lbl.setStyleSheet(f"color:{col}; border:1px solid {col}; border-radius:3px; font-weight:700;")
-        trips = [n for n, t in (("OVP", s.ovp_trip), ("OCP", s.ocp_trip)) if t]
+        ocp_name = "FUSE" if self.profile.ocp_kind == "fuse" else "OCP"
+        trips = [n for n, t in (("OVP", s.ovp_trip), (ocp_name, s.ocp_trip)) if t]
         self.trip_lbl.setVisible(bool(trips))
         self.trip_lbl.setText(" ".join(trips) + " TRIP")
         # follow the instrument unless the user is editing

@@ -18,7 +18,7 @@ DEFAULTS: dict[str, Any] = {
     "last_supply": None,
     "apply_last_on_connect": False,   # re-apply last V/I/limits (output stays OFF) after connecting
     "supplies": {},
-    "discovery": {"extra_hosts": [], "timeout": 0.4, "port": 5555},
+    "discovery": {"extra_hosts": [], "timeout": 0.4, "ports": [5555, 5025]},   # Rigol DP800, R&S/HAMEG HMP
     "ui": {
         "view_mode": 3,
         "visible": [1, 2, 3],

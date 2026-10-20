@@ -21,16 +21,16 @@ class ScanThread(QThread):
     progress = Signal(int, int)
     finished_scan = Signal(int)
 
-    def __init__(self, extra_hosts, scan_lan: bool, port: int, timeout: float, parent=None):
+    def __init__(self, extra_hosts, scan_lan: bool, ports, timeout: float, parent=None):
         super().__init__(parent)
-        self.extra_hosts, self.scan_lan, self.port, self.timeout = extra_hosts, scan_lan, port, timeout
+        self.extra_hosts, self.scan_lan, self.ports, self.timeout = extra_hosts, scan_lan, ports, timeout
         self._cancel = False
 
     def cancel(self):
         self._cancel = True
 
     def run(self):
-        res = discover(self.extra_hosts, None if self.scan_lan else [], self.port, self.timeout,
+        res = discover(self.extra_hosts, None if self.scan_lan else [], self.ports, self.timeout,
                        progress=lambda d, t: self.progress.emit(d, t),
                        found=lambda i: self.found.emit(i), cancel=lambda: self._cancel)
         self.finished_scan.emit(len(res))
@@ -39,11 +39,11 @@ class ScanThread(QThread):
 class DiscoveryDialog(QDialog):
     """Scan the LAN (TCP 5555 + *IDN?) or probe a typed IP; pick supplies to add."""
 
-    def __init__(self, parent, known_hosts: list[str], port: int = 5555, timeout: float = 0.4):
+    def __init__(self, parent, known_hosts: list[str], ports=(5555, 5025), timeout: float = 0.4):
         super().__init__(parent)
         self.setWindowTitle("Find power supplies")
         self.resize(560, 380)
-        self.known, self.port, self.timeout = known_hosts, port, timeout
+        self.known, self.ports, self.timeout = known_hosts, list(ports), timeout
         self.devices: dict[str, object] = {}
         self.selected: list = []
         self._thread: ScanThread | None = None
@@ -61,7 +61,7 @@ class DiscoveryDialog(QDialog):
         self.list.setSelectionMode(QListWidget.ExtendedSelection)
         v.addWidget(self.list, 1)
         self.bar = QProgressBar(); self.bar.setTextVisible(False); self.bar.setMaximumHeight(8)
-        self.status = QLabel("Press “Scan network” to look for supplies on the local subnets.")
+        self.status = QLabel("Press “Scan network” to look for Rigol DP800 and R&S/HAMEG HMP supplies on the local subnets.")
         v.addWidget(self.bar)
         v.addWidget(self.status)
         bb = QDialogButtonBox()
@@ -84,7 +84,7 @@ class DiscoveryDialog(QDialog):
         self.scan_btn.setEnabled(False); self.add_ip_btn.setEnabled(False)
         self.bar.setValue(0)
         self.status.setText("Scanning…" if scan_lan else f"Probing {hosts[0]}…")
-        t = ScanThread(hosts + self.known, scan_lan, self.port, timeout or self.timeout, self)
+        t = ScanThread(hosts + self.known, scan_lan, self.ports, timeout or self.timeout, self)
         t.found.connect(self._found)
         t.progress.connect(lambda d, n: (self.bar.setMaximum(n), self.bar.setValue(d)))
         t.finished_scan.connect(self._done)
@@ -124,26 +124,43 @@ class DiscoveryDialog(QDialog):
 
 # --------------------------------------------------------------------------
 class LimitsDialog(QDialog):
-    """Software V/I limit (enforced by this app on every setpoint) + instrument OVP/OCP."""
+    """Software V/I limit (enforced by this app on every setpoint) + instrument protection.
 
-    def __init__(self, parent, ch, hw_v, hw_i, vmax, imax, ovp, ovp_on, ocp, ocp_on, tripped=False):
+    Protection flavour comes from the model profile: DP800 has OVP and OCP (level + enable);
+    HMP has an always-on OVP and an electronic fuse (enable + delay in ms)."""
+
+    def __init__(self, parent, ch, hw_v, hw_i, vmax, imax, ovp, ovp_on, ocp, ocp_on, tripped=False, profile=None):
         super().__init__(parent)
+        from dp832_worker import profile_for
+        prof = profile or profile_for("DP832")
         self.setWindowTitle(f"CH{ch} limits")
         self.clear_trip = False
+        self.prof = prof
         f = QFormLayout(self)
-        self.vmax = self._spin(hw_v, vmax, 3, " V")
-        self.imax = self._spin(hw_i, imax, 4, " A")
+        self.vmax = self._spin(hw_v, vmax, 3, " V", 0.1)
+        self.imax = self._spin(hw_i, imax, 4, " A", 0.01)
         f.addRow(QLabel("<b>Software limits</b> (no setpoint above these is ever sent, "
                         "including preset and sequence values)"))
         f.addRow("Max voltage", self.vmax)
         f.addRow("Max current", self.imax)
         f.addRow(QLabel("<b>Instrument protection</b>"))
-        self.ovp = self._spin(hw_v * 1.1, ovp if ovp is not None else hw_v, 3, " V")
-        self.ovp_on = QCheckBox("OVP enabled"); self.ovp_on.setChecked(bool(ovp_on))
-        self.ocp = self._spin(hw_i * 1.1, ocp if ocp is not None else hw_i, 4, " A")
-        self.ocp_on = QCheckBox("OCP enabled"); self.ocp_on.setChecked(bool(ocp_on))
-        f.addRow("OVP level", self._row(self.ovp, self.ovp_on))
-        f.addRow("OCP level", self._row(self.ocp, self.ocp_on))
+        self.ovp = self._spin(prof.ovp_max or hw_v * 1.1, ovp if ovp is not None else hw_v, 3 if prof.ovp_enable else 2, " V", 0.1)
+        self.ovp_on = QCheckBox("OVP enabled"); self.ovp_on.setChecked(bool(ovp_on) or not prof.ovp_enable)
+        ocp_max = prof.ocp_max or hw_i * 1.1
+        default_ocp = 50.0 if prof.ocp_kind == "fuse" else hw_i
+        self.ocp = self._spin(ocp_max, ocp if ocp is not None else default_ocp, prof.ocp_decimals,
+                              f" {prof.ocp_unit}", prof.ocp_step)
+        self.ocp_on = QCheckBox(prof.ocp_enable_text); self.ocp_on.setChecked(bool(ocp_on))
+        if prof.ovp_enable:
+            f.addRow("OVP level", self._row(self.ovp, self.ovp_on))
+        else:
+            f.addRow("OVP level", self.ovp)
+            f.addRow(QLabel("<small>OVP is always active on this model.</small>"))
+        f.addRow(prof.ocp_label, self.ocp)
+        f.addRow("", self.ocp_on)
+        if prof.ocp_kind == "fuse":
+            f.addRow(QLabel("<small>The fuse trips when the channel stays in current limit (CC) for the delay; "
+                            "it re-arms when the channel is switched on again.</small>"))
         if tripped:
             b = QPushButton("Clear trip")
             b.clicked.connect(self._clear)
@@ -157,9 +174,9 @@ class LimitsDialog(QDialog):
         self.accept()
 
     @staticmethod
-    def _spin(mx, val, dec, suffix):
+    def _spin(mx, val, dec, suffix, step):
         s = QDoubleSpinBox(); s.setDecimals(dec); s.setRange(0.0, mx); s.setSuffix(suffix)
-        s.setValue(min(val, mx)); s.setSingleStep(0.1 if dec == 3 else 0.01)
+        s.setValue(min(val, mx)); s.setSingleStep(step)
         return s
 
     @staticmethod

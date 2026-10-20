@@ -27,13 +27,14 @@ from dataclasses import dataclass
 from typing import Any, Callable, Iterable, Optional
 
 from .discovery import DEFAULT_PORT, DeviceInfo, parse_idn
+from .drivers import Driver, make_driver
+from .models import ModelProfile, profile_for
 from .scpi import ScpiConnection, ScpiError
 from .sequence import SeqStep
 
 log = logging.getLogger("dp832.worker")
 
 PRIO_URGENT, PRIO_NORMAL = 0, 5
-FALLBACK_RANGES = {1: (32.0, 3.2), 2: (32.0, 3.2), 3: (5.3, 3.2)}
 
 
 class InstrumentError(Exception):
@@ -150,7 +151,8 @@ class PsuWorker:
         self.poll_channels: list[int] = [1, 2, 3]
         self.measured_rate = 0.0
         self._seq: dict[int, _SeqRunner] = {}
-        self._have_mode = self._have_all = True
+        self.driver: Optional[Driver] = None
+        self.profile: Optional[ModelProfile] = None
         self._next_poll = self._next_slow = self._next_prot = 0.0
         self._last_poll_t = 0.0
         self._last_reason = None
@@ -284,10 +286,12 @@ class PsuWorker:
             self._conn.write("*CLS")
             idn = self._conn.query("*IDN?")
             self.info = parse_idn(self.host, self.port, idn)
-            self.n_channels = self.info.n_channels
-            if "DP8" not in self.info.model.upper():
-                log.warning("unexpected instrument %r - SCPI subset may not match", idn)
-            self._probe_features()
+            self.profile = profile_for(self.info.model)
+            self.n_channels = self.profile.n_channels
+            self.driver = make_driver(self._conn, self.profile)
+            if self.profile.family == "DP800" and "DP8" not in self.info.model.upper():
+                log.warning("unexpected instrument %r - assuming the DP800 SCPI dialect", idn)
+            self.driver.probe_features()
             self._read_ranges()
         except ScpiError as e:
             self._conn.close()
@@ -301,40 +305,16 @@ class PsuWorker:
         self.connected = True
         self._last_reason = None
         self._next_poll = self._next_slow = self._next_prot = 0.0
-        log.info("connected to %s (%s)", self.host, self.info.idn)
+        log.info("connected to %s (%s) [%s driver]", self.host, self.info.idn, self.profile.family)
         self._slow_refresh(full=True)
         self._emit("connection", {
             "state": "connected", "info": self.info, "n_channels": self.n_channels,
+            "profile": self.profile,
             "ranges": dict(self.ranges), "limits": {c: tuple(v) for c, v in self.limits.items()},
         })
 
-    def _probe_optional(self, cmd: str) -> bool:
-        """A query that an instrument doesn't know never answers -> timeout.  Probe once."""
-        try:
-            self._conn.query(cmd)
-            return True
-        except ScpiError:
-            self._conn.open()           # resync the stream
-            self._conn.write("*CLS")
-            return False
-
-    def _probe_features(self) -> None:
-        self._have_mode = self._probe_optional(":OUTPut:MODE? CH1")
-        self._have_all = self._probe_optional(":MEASure:ALL? CH1")
-        if not (self._have_mode and self._have_all):
-            log.warning("instrument lacks MODE?/MEASure:ALL? (mode=%s all=%s); using fallbacks",
-                        self._have_mode, self._have_all)
-
     def _read_ranges(self) -> None:
-        for ch in range(1, self.n_channels + 1):
-            fb = FALLBACK_RANGES.get(ch, (32.0, 3.2))
-            try:
-                vmax = float(self._conn.query(f":SOURce{ch}:VOLTage? MAX"))
-                imax = float(self._conn.query(f":SOURce{ch}:CURRent? MAX"))
-            except (ScpiError, ValueError):
-                if not self._conn.is_open:
-                    self._conn.open()
-                vmax, imax = fb
+        for ch, (vmax, imax) in self.driver.read_ranges(self.n_channels).items():
             self.ranges[ch] = (vmax, imax)
             old = self.limits.get(ch)
             self.limits[ch] = [min(old[0], vmax), min(old[1], imax)] if old else [vmax, imax]
@@ -357,26 +337,8 @@ class PsuWorker:
             cmd.ticket._finish(error=ScpiError(why))
 
     # ---------------------------------------------------------------- scpi
-    def _w(self, cmd: str) -> None:
-        log.debug("> %s", cmd)
-        self._conn.write(cmd)
-
-    def _q_(self, cmd: str) -> str:
-        r = self._conn.query(cmd)
-        log.debug("> %s  < %s", cmd, r)
-        return r
-
-    def _drain_errors(self) -> list[str]:
-        errs = []
-        for _ in range(8):
-            r = self._q_(":SYSTem:ERRor?")
-            if r.split(",", 1)[0].strip() in ("0", "+0"):
-                break
-            errs.append(r)
-        return errs
-
     def _check(self, context: str) -> None:
-        errs = self._drain_errors()
+        errs = self.driver.drain_errors()
         if errs:
             msg = f"{context}: instrument error {'; '.join(errs)}"
             log.warning(msg)
@@ -399,6 +361,9 @@ class PsuWorker:
         if self.state:
             self._emit_telemetry()
 
+    def _all_channels(self) -> list:
+        return list(range(1, self.n_channels + 1))
+
     def _chan(self, ch: int) -> int:
         if not 1 <= int(ch) <= self.n_channels:
             raise ValueError(f"channel {ch} out of range 1..{self.n_channels}")
@@ -417,11 +382,10 @@ class PsuWorker:
     def _write_vi(self, ch, v, i) -> tuple:
         v, i = self._clamp(ch, v, i)
         s = self.state[ch]
+        self.driver.write_vi(ch, v, i)
         if v is not None:
-            self._w(f":SOURce{ch}:VOLTage {v:.3f}")
             s.v_set = v
         if i is not None:
-            self._w(f":SOURce{ch}:CURRent {i:.4f}")
             s.i_set = i
         return v, i
 
@@ -432,7 +396,7 @@ class PsuWorker:
         return res
 
     def _set_out(self, ch, on):
-        self._w(f":OUTPut CH{ch},{'ON' if on else 'OFF'}")
+        self.driver.set_output(ch, bool(on), self._all_channels())
         self.state[ch].output = bool(on)
         log.info("CH%d output %s", ch, "ON" if on else "OFF")
 
@@ -442,8 +406,11 @@ class PsuWorker:
         self._check(f"CH{ch} output")
 
     def _cmd_set_all_output(self, on, channels=None):
-        for ch in (channels or range(1, self.n_channels + 1)):
-            self._set_out(self._chan(ch), on)
+        chans = [self._chan(c) for c in (channels or self._all_channels())]
+        self.driver.set_outputs(bool(on), chans, self._all_channels())
+        for ch in chans:
+            self.state[ch].output = bool(on)
+        log.info("outputs %s: %s", "ON" if on else "OFF", ",".join(f"CH{c}" for c in chans))
         self._check("all outputs")
 
     def _cmd_set_limits(self, ch, vmax=None, imax=None):
@@ -458,21 +425,13 @@ class PsuWorker:
 
     def _cmd_set_protection(self, ch, ovp=None, ovp_on=None, ocp=None, ocp_on=None):
         ch = self._chan(ch)
-        if ovp is not None:
-            self._w(f":OUTPut:OVP:VALue CH{ch},{float(ovp):.3f}")
-        if ocp is not None:
-            self._w(f":OUTPut:OCP:VALue CH{ch},{float(ocp):.4f}")
-        if ovp_on is not None:
-            self._w(f":OUTPut:OVP CH{ch},{'ON' if ovp_on else 'OFF'}")
-        if ocp_on is not None:
-            self._w(f":OUTPut:OCP CH{ch},{'ON' if ocp_on else 'OFF'}")
+        self.driver.set_protection(ch, ovp, ovp_on, ocp, ocp_on)
         self._next_prot = 0.0
         self._check(f"CH{ch} protection")
 
     def _cmd_clear_protection(self, ch):
         ch = self._chan(ch)
-        self._w(f":OUTPut:OVP:CLEAR CH{ch}")
-        self._w(f":OUTPut:OCP:CLEAR CH{ch}")
+        self.driver.clear_protection(ch)
         self._check(f"CH{ch} clear protection")
 
     def _cmd_apply_setup(self, ch, v=None, i=None, vmax=None, imax=None,
@@ -483,8 +442,7 @@ class PsuWorker:
         if vmax is not None or imax is not None:
             self._cmd_set_limits(ch, vmax, imax)
         # drop to minimum so a new OVP/OCP below the old setpoint is accepted
-        self._w(f":SOURce{ch}:VOLTage MIN")
-        self._w(f":SOURce{ch}:CURRent MIN")
+        self.driver.to_minimum(ch)
         if any(x is not None for x in (ovp, ovp_on, ocp, ocp_on)):
             self._cmd_set_protection(ch, ovp, ovp_on, ocp, ocp_on)
         self._write_vi(ch, v, i)
@@ -505,8 +463,8 @@ class PsuWorker:
     def _cmd_scpi(self, text):
         text = text.strip()
         if "?" in text:
-            return self._q_(text)
-        self._w(text)
+            return self.driver.q(text)
+        self.driver.w(text)
         return None
 
     # ------------------------------------------------------------ sequences
@@ -579,14 +537,8 @@ class PsuWorker:
         if not self.poll_channels:
             return
         for ch in self.poll_channels:
-            s = self.state[ch]
-            if self._have_all:
-                parts = self._q_(f":MEASure:ALL? CH{ch}").split(",")
-                s.v, s.i, s.p = (float(x) for x in parts[:3])
-            else:
-                s.v = float(self._q_(f":MEASure:VOLTage? CH{ch}"))
-                s.i = float(self._q_(f":MEASure:CURRent? CH{ch}"))
-                s.p = s.v * s.i
+            st = self.state[ch]
+            st.v, st.i, st.p = self.driver.measure(ch)
         now = time.monotonic()
         if self._last_poll_t:
             inst = 1.0 / max(now - self._last_poll_t, 1e-3)
@@ -597,25 +549,17 @@ class PsuWorker:
     def _slow_refresh(self, full: bool = False) -> None:
         now = time.monotonic()
         do_prot = full or now >= self._next_prot
-        for ch in (range(1, self.n_channels + 1) if full else self.poll_channels):
+        self.driver.begin_refresh()
+        for ch in (self._all_channels() if full else self.poll_channels):
             s = self.state[ch]
-            s.v_set = float(self._q_(f":SOURce{ch}:VOLTage?"))
-            s.i_set = float(self._q_(f":SOURce{ch}:CURRent?"))
-            s.output = self._q_(f":OUTPut? CH{ch}").upper().startswith("ON")
-            if self._have_mode:
-                s.mode = self._q_(f":OUTPut:MODE? CH{ch}").strip().upper()
-            ovp_t = self._q_(f":OUTPut:OVP:QUES? CH{ch}").upper().startswith("YES")
-            ocp_t = self._q_(f":OUTPut:OCP:QUES? CH{ch}").upper().startswith("YES")
-            for flag, new, label in (("ovp_trip", ovp_t, "OVP"), ("ocp_trip", ocp_t, "OCP")):
-                if new and not getattr(s, flag):
+            was = (s.ovp_trip, s.ocp_trip)
+            self.driver.read_basic(ch, s)
+            for old, new, label in ((was[0], s.ovp_trip, "OVP"), (was[1], s.ocp_trip, "OCP")):
+                if new and not old:
                     log.warning("CH%d %s TRIPPED", ch, label)
                     self._emit("alarm", {"ch": ch, "type": label})
-                setattr(s, flag, new)
             if do_prot:
-                s.ovp_on = self._q_(f":OUTPut:OVP? CH{ch}").upper().startswith("ON")
-                s.ocp_on = self._q_(f":OUTPut:OCP? CH{ch}").upper().startswith("ON")
-                s.ovp_level = float(self._q_(f":OUTPut:OVP:VALue? CH{ch}"))
-                s.ocp_level = float(self._q_(f":OUTPut:OCP:VALue? CH{ch}"))
+                self.driver.read_protection(ch, s)
         if do_prot:
             self._next_prot = time.monotonic() + self.PROT_INTERVAL
         self._emit_telemetry()

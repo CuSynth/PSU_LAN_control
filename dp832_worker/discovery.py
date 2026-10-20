@@ -5,13 +5,12 @@ import ipaddress
 import socket
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, asdict
-from typing import Callable, Iterable, Optional
+from typing import Callable, Iterable, Optional, Union
 
+from .models import ALL_PORTS, PORT_RIGOL, ModelProfile, profile_for
 from .scpi import ScpiConnection, ScpiError
 
-DEFAULT_PORT = 5555
-
-MODEL_CHANNELS = {"DP811": 1, "DP811A": 1, "DP821": 2, "DP821A": 2}  # default is 3
+DEFAULT_PORT = PORT_RIGOL
 
 
 @dataclass
@@ -29,8 +28,12 @@ class DeviceInfo:
         return self.serial or f"{self.host}:{self.port}"
 
     @property
+    def profile(self) -> ModelProfile:
+        return profile_for(self.model)
+
+    @property
     def n_channels(self) -> int:
-        return MODEL_CHANNELS.get(self.model.upper(), 3)
+        return self.profile.n_channels
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -42,8 +45,15 @@ def parse_idn(host: str, port: int, idn: str) -> DeviceInfo:
     return DeviceInfo(host, port, idn, parts[0], parts[1], parts[2], parts[3])
 
 
-def probe(host: str, port: int = DEFAULT_PORT, timeout: float = 0.5) -> Optional[DeviceInfo]:
-    """Return DeviceInfo if an SCPI instrument answers *IDN? at host:port."""
+def probe(host: str, port: Union[int, Iterable[int]] = DEFAULT_PORT,
+          timeout: float = 0.5) -> Optional[DeviceInfo]:
+    """Return DeviceInfo if an SCPI instrument answers *IDN? at host:port (port may be a list)."""
+    if not isinstance(port, int):
+        for p in port:
+            info = probe(host, p, timeout)
+            if info:
+                return info
+        return None
     c = ScpiConnection(host, port, timeout=timeout)
     try:
         c.open()
@@ -98,14 +108,17 @@ def _cap(net, addr, max_hosts):
 def discover(
     extra_hosts: Iterable[str] = (),
     networks: Optional[Iterable[ipaddress.IPv4Network]] = None,
-    port: int = DEFAULT_PORT,
+    port: Union[int, Iterable[int]] = ALL_PORTS,
     timeout: float = 0.4,
     workers: int = 96,
     progress: Optional[Callable[[int, int], None]] = None,
     found: Optional[Callable[[DeviceInfo], None]] = None,
     cancel: Optional[Callable[[], bool]] = None,
 ) -> list[DeviceInfo]:
-    """Scan local subnets (plus explicit hosts) and return the instruments found."""
+    """Scan local subnets (plus explicit hosts) on the given port(s) and return the instruments found.
+
+    Default ports: 5555 (Rigol DP800) and 5025 (R&S/HAMEG HMP)."""
+    ports = [port] if isinstance(port, int) else list(port)
     hosts: list[str] = list(dict.fromkeys(extra_hosts))
     nets = list(networks) if networks is not None else local_networks()
     for n in nets:
@@ -115,7 +128,7 @@ def discover(
     if not total:
         return results
     with ThreadPoolExecutor(max_workers=workers) as ex:
-        futs = {ex.submit(probe, h, port, timeout): h for h in hosts}
+        futs = {ex.submit(probe, h, ports, timeout): h for h in hosts}
         for f in as_completed(futs):
             done += 1
             if cancel and cancel():

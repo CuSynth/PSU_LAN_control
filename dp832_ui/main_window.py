@@ -11,7 +11,7 @@ from PySide6.QtWidgets import (QComboBox, QDockWidget, QDoubleSpinBox, QHBoxLayo
                                QLabel, QMainWindow, QMessageBox, QPlainTextEdit, QPushButton,
                                QToolBar, QWidget)
 
-from dp832_worker import DataLogger, PsuWorker
+from dp832_worker import DataLogger, PsuWorker, profile_for
 from .bridge import WorkerBridge
 from .channel_panel import CH_COLORS, ChannelPanel
 from .config import N_PRESETS, Config
@@ -81,12 +81,10 @@ class MainWindow(QMainWindow):
         t2 = QToolBar("View"); t2.setMovable(False)
         self.addToolBar(t2)
         self.mode_box = QComboBox()
-        for n, name in ((1, "Single channel"), (2, "Dual channel"), (3, "Triple channel")):
-            self.mode_box.addItem(name, n)
-        self.mode_box.setCurrentIndex(max(0, min(2, self.cfg.ui["view_mode"] - 1)))
+        self._fill_mode_box(3)
         t2.addWidget(QLabel(" View: ")); t2.addWidget(self.mode_box)
         self.ch_btns: dict[int, QPushButton] = {}
-        for c in (1, 2, 3):
+        for c in (1, 2, 3, 4):
             b = QPushButton(f"CH{c}"); b.setCheckable(True); b.setFixedWidth(52)
             b.setToolTip("Click an inactive channel to swap it into the view")
             b.setStyleSheet(f"QPushButton:checked {{ background:{CH_COLORS[c]}; color:#14161a; font-weight:700; }}")
@@ -124,6 +122,16 @@ class MainWindow(QMainWindow):
         clear.clicked.connect(lambda: [p.clear_plots() for p in self.panels.values()])
         self.rec_btn.clicked.connect(self._toggle_record)
         seq.clicked.connect(self._open_sequence)
+
+    def _fill_mode_box(self, n: int):
+        """View choices depend on how many channels the supply has (HMP4040: up to quad)."""
+        names = {1: "Single channel", 2: "Dual channel", 3: "Triple channel", 4: "Quad channel"}
+        self.mode_box.blockSignals(True)
+        self.mode_box.clear()
+        for k in range(1, max(1, n) + 1):
+            self.mode_box.addItem(names[k], k)
+        self.mode_box.setCurrentIndex(max(0, min(n, self.cfg.ui["view_mode"]) - 1))
+        self.mode_box.blockSignals(False)
 
     def _build_central(self):
         self.central = QWidget()
@@ -178,7 +186,7 @@ class MainWindow(QMainWindow):
     def _find_supplies(self):
         d = self.cfg.data["discovery"]
         known = [s["ip"] for s in self.cfg.supplies.values()] + list(d.get("extra_hosts", []))
-        dlg = DiscoveryDialog(self, known, d.get("port", 5555), d.get("timeout", 0.4))
+        dlg = DiscoveryDialog(self, known, d.get("ports", [5555, 5025]), d.get("timeout", 0.4))
         dlg.show()
         if dlg.exec() and dlg.selected:
             first = None
@@ -240,9 +248,11 @@ class MainWindow(QMainWindow):
             p.deleteLater()
         self.panels.clear()
         self.placeholder.hide()
+        prof = profile_for((self.cfg.supply(self.sid) or {}).get("model", ""))
+        self._fill_mode_box(n)
         for c in range(1, n + 1):
-            vmax, imax = (5.3, 3.2) if c == 3 else (32.0, 3.2)
-            p = ChannelPanel(c, vmax, imax)
+            vmax, imax = prof.range(c)
+            p = ChannelPanel(c, vmax, imax, prof)
             p.setpoint_requested.connect(self._setpoint)
             p.output_requested.connect(self._output)
             p.limits_requested.connect(self._limits)
@@ -279,7 +289,7 @@ class MainWindow(QMainWindow):
         for c, p in self.panels.items():
             p.setVisible(c in self.visible)
         for c, b in self.ch_btns.items():
-            b.setEnabled(c in self.panels)
+            b.setVisible(c in self.panels)
             b.setChecked(c in self.visible)
         self.mode_box.setCurrentIndex(self.cfg.ui["view_mode"] - 1)
         self._push_poll()
@@ -360,7 +370,7 @@ class MainWindow(QMainWindow):
         dlg = LimitsDialog(self, ch, hv, hi, sv, si,
                            s.ovp_level if s else None, s.ovp_on if s else False,
                            s.ocp_level if s else None, s.ocp_on if s else False,
-                           tripped=bool(s and (s.ovp_trip or s.ocp_trip)))
+                           tripped=bool(s and (s.ovp_trip or s.ocp_trip)), profile=w.profile)
         if not dlg.exec():
             return
         if dlg.clear_trip:
